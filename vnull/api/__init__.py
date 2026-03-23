@@ -1,1 +1,6 @@
+"""FastAPI server for Zero-Null RAG."""
+
+from vnull.api.server import create_app
+
+__all__ = ["create_app"]
 
