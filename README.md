@@ -121,9 +121,9 @@ DATA_DIR=./data
 ```
 
 # Simple examples (no LLM required)
-python -m examples.example_usage bloom
-python -m examples.example_usage prune
-python -m examples.example_usage chunk
+python -m examples.example_usage bloom/n
+python -m examples.example_usage prune/n
+python -m examples.example_usage chunk/n
 python -m examples.example_usage bm25
 
 # Full pipeline (requires llama.cpp on port 8000)
