@@ -5,9 +5,10 @@ DO NOT ping the real OpenAI API - this is strictly for local LLM.
 """
 
 import asyncio
+import json
 import re
 from collections.abc import AsyncGenerator
-from typing import Any, Literal
+from typing import Any
 
 from openai import AsyncOpenAI, OpenAI
 from pydantic import BaseModel
@@ -35,17 +36,7 @@ class LLMResponse(BaseModel):
 
 
 class LLMClient:
-    """Client for interacting with local LLM via OpenAI-compatible API.
-
-    Configured strictly for local llama.cpp server inference.
-    Uses the OpenAI SDK with custom base_url pointing to localhost.
-
-    Example:
-        >>> client = LLMClient()
-        >>> response = await client.complete("Translate this HTML to Markdown: <h1>Hello</h1>")
-        >>> print(response.content)
-        # Hello
-    """
+    """Client for interacting with local LLM via OpenAI-compatible API."""
 
     def __init__(
         self,
@@ -56,16 +47,6 @@ class LLMClient:
         max_tokens: int | None = None,
         timeout: float | None = None,
     ) -> None:
-        """Initialize LLM client.
-
-        Args:
-            base_url: LLM server URL. Defaults to settings.llm_base_url.
-            api_key: API key. Defaults to settings.llm_api_key.
-            model: Model identifier. Defaults to settings.llm_model.
-            temperature: Generation temperature. Defaults to settings.llm_temperature.
-            max_tokens: Max response tokens. Defaults to settings.llm_max_tokens.
-            timeout: Request timeout in seconds. Defaults to settings.llm_timeout.
-        """
         self.base_url = base_url or settings.llm_base_url
         self.api_key = api_key or settings.llm_api_key
         self.model = model or settings.llm_model
@@ -73,14 +54,12 @@ class LLMClient:
         self.max_tokens = max_tokens or settings.llm_max_tokens
         self.timeout = timeout or settings.llm_timeout
 
-        # Async client for most operations
         self._async_client = AsyncOpenAI(
             base_url=self.base_url,
             api_key=self.api_key,
             timeout=self.timeout,
         )
 
-        # Sync client for blocking operations
         self._sync_client = OpenAI(
             base_url=self.base_url,
             api_key=self.api_key,
@@ -93,8 +72,49 @@ class LLMClient:
             model=self.model,
         )
 
+    def _extract_content_and_usage(self, response: Any) -> tuple[str, str | None, Any]:
+        """Normalize OpenAI-compatible responses robustly."""
+        content = ""
+        finish_reason = None
+        usage = getattr(response, "usage", None)
+
+        try:
+            choices = getattr(response, "choices", None) or []
+            if choices:
+                c0 = choices[0]
+                finish_reason = getattr(c0, "finish_reason", None)
+
+                # Chat-completions shape
+                msg = getattr(c0, "message", None)
+                if msg is not None:
+                    msg_content = getattr(msg, "content", None)
+                    if isinstance(msg_content, str):
+                        content = msg_content
+                    elif isinstance(msg_content, list):
+                        # Some providers return typed blocks
+                        parts: list[str] = []
+                        for part in msg_content:
+                            if isinstance(part, dict):
+                                txt = part.get("text")
+                                if isinstance(txt, str):
+                                    parts.append(txt)
+                        content = "".join(parts)
+
+                # Legacy/text fallback
+                if not content:
+                    txt = getattr(c0, "text", None)
+                    if isinstance(txt, str):
+                        content = txt
+        except Exception as e:
+            logger.warning("Failed to normalize LLM response", error=str(e))
+
+        if content is None:
+            content = ""
+
+        return content, finish_reason, usage
+
     @retry(
-        retry=retry_if_exception_type((TimeoutError, ConnectionError)),
+        retry=retry_if_exception_type((TimeoutError, ConnectionError, asyncio.TimeoutError)),
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
     )
@@ -106,18 +126,6 @@ class LLMClient:
         max_tokens: int | None = None,
         stop: list[str] | None = None,
     ) -> LLMResponse:
-        """Generate a completion from the LLM.
-
-        Args:
-            prompt: User prompt/message.
-            system_prompt: Optional system prompt for context.
-            temperature: Override default temperature.
-            max_tokens: Override default max tokens.
-            stop: Stop sequences.
-
-        Returns:
-            LLMResponse with content and token usage.
-        """
         messages: list[dict[str, str]] = []
 
         if system_prompt:
@@ -139,22 +147,21 @@ class LLMClient:
             stop=stop,
         )
 
-        content = response.choices[0].message.content or ""
-        usage = response.usage
+        content, finish_reason, usage = self._extract_content_and_usage(response)
 
         logger.debug(
             "Completion received",
             content_length=len(content),
-            finish_reason=response.choices[0].finish_reason,
-            tokens=usage.total_tokens if usage else None,
+            finish_reason=finish_reason,
+            tokens=getattr(usage, "total_tokens", None) if usage else None,
         )
 
         return LLMResponse(
-            content=content,
-            finish_reason=response.choices[0].finish_reason,
-            prompt_tokens=usage.prompt_tokens if usage else None,
-            completion_tokens=usage.completion_tokens if usage else None,
-            total_tokens=usage.total_tokens if usage else None,
+            content=content or "",
+            finish_reason=finish_reason,
+            prompt_tokens=getattr(usage, "prompt_tokens", None) if usage else None,
+            completion_tokens=getattr(usage, "completion_tokens", None) if usage else None,
+            total_tokens=getattr(usage, "total_tokens", None) if usage else None,
         )
 
     async def stream(
@@ -166,22 +173,6 @@ class LLMClient:
         stop: list[str] | None = None,
         hide_think_tags: bool = True,
     ) -> AsyncGenerator[str, None]:
-        """Stream completion tokens from the LLM.
-
-        Implements streaming generator that can intercept and hide
-        <think>...</think> tags from the output.
-
-        Args:
-            prompt: User prompt/message.
-            system_prompt: Optional system prompt.
-            temperature: Override default temperature.
-            max_tokens: Override default max tokens.
-            stop: Stop sequences.
-            hide_think_tags: If True, filter out <think>...</think> content.
-
-        Yields:
-            String tokens as they arrive.
-        """
         messages: list[dict[str, str]] = []
 
         if system_prompt:
@@ -200,58 +191,50 @@ class LLMClient:
 
         if hide_think_tags:
             async for token in self._filter_think_tags(stream):
-                yield token
+                if token:
+                    yield token
         else:
             async for chunk in stream:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    yield chunk.choices[0].delta.content
+                try:
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        yield chunk.choices[0].delta.content
+                except Exception:
+                    continue
 
-    async def _filter_think_tags(
-        self,
-        stream: Any,
-    ) -> AsyncGenerator[str, None]:
-        """Filter out <think>...</think> tags from streaming output.
-
-        Implements a state machine to track when we're inside think tags
-        and buffer content appropriately.
-        """
+    async def _filter_think_tags(self, stream: Any) -> AsyncGenerator[str, None]:
         buffer = ""
         in_think_block = False
         think_start = "<think>"
         think_end = "</think>"
 
         async for chunk in stream:
-            if not chunk.choices or not chunk.choices[0].delta.content:
+            try:
+                if not chunk.choices or not chunk.choices[0].delta.content:
+                    continue
+                token = chunk.choices[0].delta.content
+            except Exception:
                 continue
 
-            token = chunk.choices[0].delta.content
             buffer += token
 
             while True:
                 if in_think_block:
-                    # Look for end of think block
                     end_idx = buffer.find(think_end)
                     if end_idx != -1:
-                        # Found end, discard think content
                         buffer = buffer[end_idx + len(think_end) :]
                         in_think_block = False
                     else:
-                        # Still in think block, check if we might have partial end tag
                         if len(buffer) > len(think_end):
-                            # Keep only potential partial tag
                             buffer = buffer[-(len(think_end) - 1) :]
                         break
                 else:
-                    # Look for start of think block
                     start_idx = buffer.find(think_start)
                     if start_idx != -1:
-                        # Yield content before think block
                         if start_idx > 0:
                             yield buffer[:start_idx]
                         buffer = buffer[start_idx + len(think_start) :]
                         in_think_block = True
                     else:
-                        # Check for partial start tag at end
                         safe_end = 0
                         for i in range(1, len(think_start)):
                             if buffer.endswith(think_start[:i]):
@@ -259,16 +242,13 @@ class LLMClient:
                                 break
 
                         if safe_end > 0:
-                            # Yield everything except potential partial tag
-                            yield buffer[: -safe_end]
+                            yield buffer[:-safe_end]
                             buffer = buffer[-safe_end:]
                         else:
-                            # No partial tag, yield everything
                             yield buffer
                             buffer = ""
                         break
 
-        # Yield any remaining content not in think block
         if buffer and not in_think_block:
             yield buffer
 
@@ -278,38 +258,21 @@ class LLMClient:
         system_prompt: str | None = None,
         temperature: float | None = None,
     ) -> dict[str, Any] | list[Any]:
-        """Generate a JSON response from the LLM.
-
-        Attempts to parse the response as JSON, with fallback extraction.
-
-        Args:
-            prompt: User prompt requesting JSON output.
-            system_prompt: Optional system prompt.
-            temperature: Override default temperature.
-
-        Returns:
-            Parsed JSON as dict or list.
-
-        Raises:
-            ValueError: If response cannot be parsed as JSON.
-        """
-        import json
-
         response = await self.complete(
             prompt=prompt,
             system_prompt=system_prompt,
-            temperature=temperature or 0.0,  # Lower temp for structured output
+            temperature=temperature if temperature is not None else 0.0,
         )
 
-        content = response.content.strip()
+        content = (response.content or "").strip()
 
-        # Try direct parse first
+        # 1) direct parse
         try:
             return json.loads(content)
         except json.JSONDecodeError:
             pass
 
-        # Try to extract JSON from markdown code blocks
+        # 2) code fence parse
         json_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", content)
         if json_match:
             try:
@@ -317,16 +280,17 @@ class LLMClient:
             except json.JSONDecodeError:
                 pass
 
-        # Try to find JSON array or object
-        for pattern in [r"(\[.*\])", r"(\{.*\})"]:
-            match = re.search(pattern, content, re.DOTALL)
+        # 3) greedy object/array extraction fallback
+        for pattern in [r"(\{[\s\S]*\})", r"(\[[\s\S]*\])"]:
+            match = re.search(pattern, content)
             if match:
+                candidate = match.group(1).strip()
                 try:
-                    return json.loads(match.group(1))
+                    return json.loads(candidate)
                 except json.JSONDecodeError:
                     continue
 
-        raise ValueError(f"Could not parse JSON from response: {content[:200]}...")
+        raise ValueError(f"Could not parse JSON from response: {content[:300]}...")
 
     def complete_sync(
         self,
@@ -335,17 +299,6 @@ class LLMClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> LLMResponse:
-        """Synchronous completion for non-async contexts.
-
-        Args:
-            prompt: User prompt/message.
-            system_prompt: Optional system prompt.
-            temperature: Override default temperature.
-            max_tokens: Override default max tokens.
-
-        Returns:
-            LLMResponse with content and token usage.
-        """
         messages: list[dict[str, str]] = []
 
         if system_prompt:
@@ -360,25 +313,18 @@ class LLMClient:
             max_tokens=max_tokens or self.max_tokens,
         )
 
-        content = response.choices[0].message.content or ""
-        usage = response.usage
+        content, finish_reason, usage = self._extract_content_and_usage(response)
 
         return LLMResponse(
-            content=content,
-            finish_reason=response.choices[0].finish_reason,
-            prompt_tokens=usage.prompt_tokens if usage else None,
-            completion_tokens=usage.completion_tokens if usage else None,
-            total_tokens=usage.total_tokens if usage else None,
+            content=content or "",
+            finish_reason=finish_reason,
+            prompt_tokens=getattr(usage, "prompt_tokens", None) if usage else None,
+            completion_tokens=getattr(usage, "completion_tokens", None) if usage else None,
+            total_tokens=getattr(usage, "total_tokens", None) if usage else None,
         )
 
     async def flush_kv_cache(self) -> None:
-        """Attempt to flush KV cache on the LLM server.
-
-        This is server-specific and may not be supported by all backends.
-        For llama.cpp, we send a minimal request to help clear context.
-        """
         try:
-            # Send a minimal completion to help rotate KV cache
             await self._async_client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": "."}],
@@ -390,34 +336,25 @@ class LLMClient:
             logger.warning("KV cache flush failed", error=str(e))
 
     async def health_check(self) -> bool:
-        """Check if the LLM server is responsive.
-
-        Returns:
-            True if server responds, False otherwise.
-        """
         try:
             response = await self.complete(
                 prompt="Say 'ok'",
                 max_tokens=5,
                 temperature=0,
             )
-            return bool(response.content)
+            return bool((response.content or "").strip())
         except Exception as e:
             logger.error("LLM health check failed", error=str(e))
             return False
 
     async def __aenter__(self) -> "LLMClient":
-        """Async context manager entry."""
         return self
 
     async def __aexit__(self, *args: Any) -> None:
-        """Async context manager exit."""
         await self._async_client.close()
 
     def __enter__(self) -> "LLMClient":
-        """Sync context manager entry."""
         return self
 
     def __exit__(self, *args: Any) -> None:
-        """Sync context manager exit."""
         self._sync_client.close()
