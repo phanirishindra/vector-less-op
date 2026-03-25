@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  vnull:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - LLM_BASE_URL=http://llama:8000/v1
+      - LLM_API_KEY=sk-local
+      - LLM_MODEL=qwen2.5-3b-instruct
+      - DATA_DIR=/app/data
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - llama
+    restart: unless-stopped
+
+  llama:
+    image: ghcr.io/ggerganov/llama.cpp:server
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/models
+    command: >
+      --model /models/qwen2.5-3b-instruct.gguf
+      --host 0.0.0.0
+      --port 8000
+      --ctx-size 4096
+      --n-gpu-layers 0
+    restart: unless-stopped
+
+volumes:
+  data:
