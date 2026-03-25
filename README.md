@@ -120,6 +120,17 @@ MAX_TOKENS_PER_CHUNK=6000
 DATA_DIR=./data
 ```
 
+# Simple examples (no LLM required)
+python -m examples.example_usage bloom
+python -m examples.example_usage prune
+python -m examples.example_usage chunk
+python -m examples.example_usage bm25
+
+# Full pipeline (requires llama.cpp on port 8000)
+python -m examples.example_usage full
+
+
+
 ## License
 
 MIT License
